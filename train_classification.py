@@ -1,4 +1,7 @@
 import argparse
+import os
+import csv
+from datetime import datetime
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -45,8 +48,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, advanced_aug=No
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # ---------------------------------------------------------
+    # KHỞI TẠO THƯ MỤC LƯU CHECKPOINT (Giúp bảo vệ trọng số)
+    # ---------------------------------------------------------
+    os.makedirs(args.save_dir, exist_ok=True)
+    
     # 1. Khởi tạo Model theo từng experiment
-    # model_names hỗ trợ từ timm: 'resnet50', 'efficientnet_b3', 'convnext_tiny', 'swin_tiny_patch4_window7_224', 'vit_base_patch16_224'
     model = create_model(model_name=args.model_name, aggregation=args.aggregation, num_classes=7)
     model.to(device)
     
@@ -63,26 +70,81 @@ def main(args):
         
     print(f"\n--- Bắt đầu thử nghiệm Classification ---")
     print(f"Device: {device}")
-    print(f"Backbone Model (Exp A): {args.model_name}")
-    print(f"Loss Function (Exp B): {args.loss}")
-    print(f"Aggregation (Exp C): {args.aggregation}")
-    print(f"Advanced Augmentation (Exp D): {args.advanced_aug}")
+    print(f"Thư mục lưu an toàn (Checkpoint Dir): {args.save_dir}")
+    print(f"Backbone: {args.model_name} | Loss: {args.loss} | Aggregation: {args.aggregation}")
     
-    # Huấn luyện mô hình (chờ có dữ liệu thực tế ở Dataset module)
-    print("Sẵn sàng huấn luyện khi có dữ liệu!\n")
+    # ---------------------------------------------------------
+    # HUẤN LUYỆN VÀ TỰ ĐỘNG LƯU TRỌNG SỐ (SAVE CHECKPOINTS)
+    # ---------------------------------------------------------
+    best_loss = float('inf')
+    # dummy_dataloader = [] # Sẽ thay bằng DataLoader thật ở Phase sau
+    
+    print("\n[Mô phỏng vòng lặp huấn luyện...]")
+    for epoch in range(args.epochs):
+        # train_loss = train_epoch(model, dummy_dataloader, optimizer, criterion, device, advanced_aug)
+        
+        # Giả lập train_loss giảm dần để test logic lưu file
+        train_loss = 1.0 / (epoch + 1)
+        
+        # 1. LƯU MÔ HÌNH SAU MỖI EPOCH (Để phòng hờ rớt mạng có thể resume lại)
+        last_model_path = os.path.join(args.save_dir, 'last_model.pth')
+        torch.save(model.state_dict(), last_model_path)
+        
+        # 2. LƯU MÔ HÌNH TỐT NHẤT (Dùng để mang đi test thực tế trên Web App)
+        if train_loss < best_loss:
+            best_loss = train_loss
+            best_model_path = os.path.join(args.save_dir, 'best_model.pth')
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Epoch {epoch+1}/{args.epochs}: Loss cải thiện ({best_loss:.4f}) -> Đã lưu '{best_model_path}'")
+        else:
+            print(f"Epoch {epoch+1}/{args.epochs}: Loss ({train_loss:.4f}) -> Đã cập nhật '{last_model_path}'")
+            
+    print(f"\nHoàn tất huấn luyện. Trọng số của bạn đã được bảo vệ an toàn tại: {args.save_dir}")
+    
+    # ---------------------------------------------------------
+    # LƯU NHẬT KÝ THỬ NGHIỆM (LOGGING) VÀO CSV
+    # ---------------------------------------------------------
+    log_file = os.path.join(args.save_dir, 'experiments_log.csv')
+    file_exists = os.path.isfile(log_file)
+    
+    with open(log_file, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # Ghi Header nếu file chưa tồn tại
+        if not file_exists:
+            writer.writerow(['Thời_gian', 'Ghi_chú_mô_tả', 'Model', 'Loss_Fn', 'Aggregation', 'Augmentation', 'Best_Loss'])
+        
+        # Ghi kết quả của lần chạy này
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([
+            current_time, 
+            args.note, 
+            args.model_name, 
+            args.loss, 
+            args.aggregation, 
+            args.advanced_aug, 
+            f"{best_loss:.4f}"
+        ])
+    print(f"-> Đã ghi log kết quả thực nghiệm vào: {log_file}")
         
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    # Experiment A
-    parser.add_argument('--model_name', type=str, default='resnet50', help='Tên mô hình timm (resnet50, efficientnet_b3, swin_tiny_patch4_window7_224,...)')
-    # Experiment C
+    
+    # =========================================================
+    # QUAN TRỌNG: Thêm tham số đường dẫn lưu file (--save_dir)
+    # =========================================================
+    parser.add_argument('--save_dir', type=str, default='./checkpoints', 
+                        help='Thư mục lưu trọng số. Khi chạy trên Colab, bạn hãy truyền path của Google Drive vào đây.')
+    
+    # Các tham số của Experiments
+    parser.add_argument('--note', type=str, default='Không có ghi chú', 
+                        help='Ghi chú mô tả cho lần chạy này (vd: "Test ResNet với Focal Loss để khắc phục imbalance")')
+    
+    parser.add_argument('--model_name', type=str, default='resnet50', help='Tên mô hình timm')
     parser.add_argument('--aggregation', type=str, default='gap', choices=['gap', 'attention', 'gated_attention', 'cls_token'])
-    # Experiment B
     parser.add_argument('--loss', type=str, default='bce', choices=['bce', 'weighted_bce', 'focal', 'asl'])
-    # Experiment D
     parser.add_argument('--advanced_aug', type=str, default='none', choices=['none', 'mixup', 'cutmix'])
     
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=5)
     args = parser.parse_args()
     main(args)
