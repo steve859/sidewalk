@@ -2,149 +2,329 @@ import argparse
 import os
 import csv
 from datetime import datetime
+
 import torch
 import torch.nn as nn
-from tqdm import tqdm
 
-from src.models.classifier import create_model
+from src.models.classifier import create_model, ENCODER_ZOO
 from src.losses.losses import FocalLoss, AsymmetricLoss
-from src.dataset.augmentations import get_mixup_cutmix
+from src.label_map import NUM_CLASSES
+
 
 def get_loss_fn(loss_name, device):
-    if loss_name == 'bce':
-        return nn.BCEWithLogitsLoss()
-    elif loss_name == 'weighted_bce':
-        # Trọng số ví dụ (sẽ cần tính toán từ phân phối của tập dữ liệu thực tế)
-        pos_weight = torch.ones([7]) * 2.0 
-        return nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
-    elif loss_name == 'focal':
-        return FocalLoss(alpha=1.0, gamma=2.0)
-    elif loss_name == 'asl':
-        return AsymmetricLoss(gamma_neg=4, gamma_pos=1, clip=0.05)
-    else:
-        raise ValueError(f"Unknown loss: {loss_name}")
+    loss_name = loss_name.lower()
 
-def train_epoch(model, dataloader, optimizer, criterion, device, advanced_aug=None):
+    if loss_name == "bce":
+        return nn.BCEWithLogitsLoss()
+
+    if loss_name == "weighted_bce":
+        # Temporary placeholder.
+        # Later, calculate this from real training label distribution.
+        pos_weight = torch.ones(NUM_CLASSES) * 2.0
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+
+    if loss_name == "focal":
+        return FocalLoss(alpha=1.0, gamma=2.0, reduction="mean")
+
+    if loss_name == "asl":
+        return AsymmetricLoss(
+            gamma_neg=4,
+            gamma_pos=1,
+            clip=0.05,
+        )
+
+    raise ValueError(
+        f"Unknown loss: {loss_name}. "
+        "Available losses: bce, weighted_bce, focal, asl"
+    )
+
+
+def save_checkpoint(
+    save_path,
+    model,
+    optimizer,
+    epoch,
+    best_loss,
+    args,
+):
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_loss": best_loss,
+        "encoder_name": args.encoder_name,
+        "aggregation": args.aggregation,
+        "loss": args.loss,
+        "num_classes": NUM_CLASSES,
+    }
+
+    torch.save(checkpoint, save_path)
+
+
+def train_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    advanced_aug=None,
+):
+    """
+    Real training epoch.
+
+    For now, if dataloader is None, this returns None.
+    Later, replace train_loader = None with real DataLoader.
+    """
+
+    if dataloader is None:
+        return None
+
     model.train()
-    total_loss = 0
-    # Dummy loop cho việc minh họa pipeline
-    # for images, targets in tqdm(dataloader, desc="Training"):
-    #     images, targets = images.to(device), targets.to(device)
-    #     
-    #     if advanced_aug:
-    #         # Apply Mixup or Cutmix on batch level
-    #         images, targets = advanced_aug(images, targets)
-    #         
-    #     optimizer.zero_grad()
-    #     outputs = model(images)
-    #     loss = criterion(outputs, targets)
-    #     loss.backward()
-    #     optimizer.step()
-    #     
-    #     total_loss += loss.item()
-        
-    return total_loss / max(1, len(dataloader) if dataloader else 1)
+    total_loss = 0.0
+
+    for images, targets in dataloader:
+        images = images.to(device)
+        targets = targets.float().to(device)
+
+        if advanced_aug is not None:
+            images, targets = advanced_aug(images, targets)
+
+        optimizer.zero_grad()
+
+        logits = model(images)
+        loss = criterion(logits, targets)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / max(1, len(dataloader))
+
+
+def run_dummy_epoch(epoch):
+    """
+    Temporary dummy loss for testing training-script logic
+    before the real dataset is ready.
+    """
+
+    return 1.0 / (epoch + 1)
+
+
+def write_experiment_log(args, best_loss):
+    log_file = os.path.join(args.save_dir, "experiments_log.csv")
+    file_exists = os.path.isfile(log_file)
+
+    with open(log_file, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "time",
+                "note",
+                "encoder_name",
+                "loss",
+                "aggregation",
+                "advanced_aug",
+                "pretrained",
+                "best_loss",
+            ])
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        writer.writerow([
+            current_time,
+            args.note,
+            args.encoder_name,
+            args.loss,
+            args.aggregation,
+            args.advanced_aug,
+            args.pretrained,
+            f"{best_loss:.4f}",
+        ])
+
+    print(f"Experiment log saved to: {log_file}")
+
 
 def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # ---------------------------------------------------------
-    # KHỞI TẠO THƯ MỤC LƯU CHECKPOINT (Giúp bảo vệ trọng số)
-    # ---------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     os.makedirs(args.save_dir, exist_ok=True)
-    
-    # 1. Khởi tạo Model theo từng experiment
-    model = create_model(model_name=args.model_name, aggregation=args.aggregation, num_classes=7)
-    model.to(device)
-    
-    # 2. Loss Function
-    criterion = get_loss_fn(args.loss, device)
-    
-    # 3. Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    
-    # 4. Advanced Augmentation (Experiment D)
-    advanced_aug = None
-    if args.advanced_aug in ['mixup', 'cutmix']:
-        advanced_aug = get_mixup_cutmix(mode=args.advanced_aug, num_classes=7)
-        
-    print(f"\n--- Bắt đầu thử nghiệm Classification ---")
+
+    print("\n--- Sidewalk Encroachment Classification Training ---")
     print(f"Device: {device}")
-    print(f"Thư mục lưu an toàn (Checkpoint Dir): {args.save_dir}")
-    print(f"Backbone: {args.model_name} | Loss: {args.loss} | Aggregation: {args.aggregation}")
-    
-    # ---------------------------------------------------------
-    # HUẤN LUYỆN VÀ TỰ ĐỘNG LƯU TRỌNG SỐ (SAVE CHECKPOINTS)
-    # ---------------------------------------------------------
-    best_loss = float('inf')
-    # dummy_dataloader = [] # Sẽ thay bằng DataLoader thật ở Phase sau
-    
-    print("\n[Mô phỏng vòng lặp huấn luyện...]")
+    print(f"Save directory: {args.save_dir}")
+    print(f"Encoder: {args.encoder_name}")
+    print(f"Timm model: {ENCODER_ZOO[args.encoder_name]}")
+    print(f"Pretrained: {args.pretrained}")
+    print(f"Loss: {args.loss}")
+    print(f"Aggregation: {args.aggregation}")
+    print(f"Advanced augmentation: {args.advanced_aug}")
+    print(f"Number of classes: {NUM_CLASSES}")
+
+    model = create_model(
+        encoder_name=args.encoder_name,
+        aggregation=args.aggregation,
+        num_classes=NUM_CLASSES,
+        pretrained=args.pretrained,
+    )
+
+    model = model.to(device)
+
+    criterion = get_loss_fn(args.loss, device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    advanced_aug = None
+
+    if args.advanced_aug in ["mixup", "cutmix"]:
+        raise NotImplementedError(
+            "Mixup/CutMix will be added after augmentations.py is finalized."
+        )
+
+    train_loader = None
+
+    best_loss = float("inf")
+
+    print("\nTraining loop started.")
+    print("Dataset is not ready yet, so this script is running in dummy mode.\n")
+
     for epoch in range(args.epochs):
-        # train_loss = train_epoch(model, dummy_dataloader, optimizer, criterion, device, advanced_aug)
-        
-        # Giả lập train_loss giảm dần để test logic lưu file
-        train_loss = 1.0 / (epoch + 1)
-        
-        # 1. LƯU MÔ HÌNH SAU MỖI EPOCH (Để phòng hờ rớt mạng có thể resume lại)
-        last_model_path = os.path.join(args.save_dir, 'last_model.pth')
-        torch.save(model.state_dict(), last_model_path)
-        
-        # 2. LƯU MÔ HÌNH TỐT NHẤT (Dùng để mang đi test thực tế trên Web App)
+        train_loss = train_epoch(
+            model=model,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            advanced_aug=advanced_aug,
+        )
+
+        if train_loss is None:
+            train_loss = run_dummy_epoch(epoch)
+
+        last_model_path = os.path.join(args.save_dir, "last_model.pth")
+
+        save_checkpoint(
+            save_path=last_model_path,
+            model=model,
+            optimizer=optimizer,
+            epoch=epoch + 1,
+            best_loss=best_loss,
+            args=args,
+        )
+
         if train_loss < best_loss:
             best_loss = train_loss
-            best_model_path = os.path.join(args.save_dir, 'best_model.pth')
-            torch.save(model.state_dict(), best_model_path)
-            print(f"Epoch {epoch+1}/{args.epochs}: Loss cải thiện ({best_loss:.4f}) -> Đã lưu '{best_model_path}'")
+
+            best_model_path = os.path.join(args.save_dir, "best_model.pth")
+
+            save_checkpoint(
+                save_path=best_model_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                best_loss=best_loss,
+                args=args,
+            )
+
+            print(
+                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"loss: {train_loss:.4f} | "
+                "best improved -> saved best_model.pth"
+            )
         else:
-            print(f"Epoch {epoch+1}/{args.epochs}: Loss ({train_loss:.4f}) -> Đã cập nhật '{last_model_path}'")
-            
-    print(f"\nHoàn tất huấn luyện. Trọng số của bạn đã được bảo vệ an toàn tại: {args.save_dir}")
-    
-    # ---------------------------------------------------------
-    # LƯU NHẬT KÝ THỬ NGHIỆM (LOGGING) VÀO CSV
-    # ---------------------------------------------------------
-    log_file = os.path.join(args.save_dir, 'experiments_log.csv')
-    file_exists = os.path.isfile(log_file)
-    
-    with open(log_file, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        # Ghi Header nếu file chưa tồn tại
-        if not file_exists:
-            writer.writerow(['Thời_gian', 'Ghi_chú_mô_tả', 'Model', 'Loss_Fn', 'Aggregation', 'Augmentation', 'Best_Loss'])
-        
-        # Ghi kết quả của lần chạy này
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        writer.writerow([
-            current_time, 
-            args.note, 
-            args.model_name, 
-            args.loss, 
-            args.aggregation, 
-            args.advanced_aug, 
-            f"{best_loss:.4f}"
-        ])
-    print(f"-> Đã ghi log kết quả thực nghiệm vào: {log_file}")
-        
-if __name__ == '__main__':
+            print(
+                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"loss: {train_loss:.4f} | "
+                "saved last_model.pth"
+            )
+
+    write_experiment_log(args, best_loss)
+
+    print("\nTraining script finished.")
+    print(f"Best loss: {best_loss:.4f}")
+    print(f"Checkpoints saved in: {args.save_dir}")
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    
-    # =========================================================
-    # QUAN TRỌNG: Thêm tham số đường dẫn lưu file (--save_dir)
-    # =========================================================
-    parser.add_argument('--save_dir', type=str, default='./checkpoints', 
-                        help='Thư mục lưu trọng số. Khi chạy trên Colab, bạn hãy truyền path của Google Drive vào đây.')
-    
-    # Các tham số của Experiments
-    parser.add_argument('--note', type=str, default='Không có ghi chú', 
-                        help='Ghi chú mô tả cho lần chạy này (vd: "Test ResNet với Focal Loss để khắc phục imbalance")')
-    
-    parser.add_argument('--model_name', type=str, default='resnet50', help='Tên mô hình timm')
-    parser.add_argument('--aggregation', type=str, default='gap', choices=['gap', 'attention', 'gated_attention', 'cls_token'])
-    parser.add_argument('--loss', type=str, default='bce', choices=['bce', 'weighted_bce', 'focal', 'asl'])
-    parser.add_argument('--advanced_aug', type=str, default='none', choices=['none', 'mixup', 'cutmix'])
-    
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=5)
+
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="./checkpoints",
+        help="Directory to save checkpoints and logs.",
+    )
+
+    parser.add_argument(
+        "--note",
+        type=str,
+        default="No note",
+        help="Experiment note.",
+    )
+
+    parser.add_argument(
+        "--encoder_name",
+        type=str,
+        default="resnet50",
+        choices=list(ENCODER_ZOO.keys()),
+        help="Encoder name from ENCODER_ZOO.",
+    )
+
+    parser.add_argument(
+        "--aggregation",
+        type=str,
+        default="gap",
+        choices=["gap", "attention", "gated_attention", "cls_token"],
+        help="Feature aggregation method.",
+    )
+
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="bce",
+        choices=["bce", "weighted_bce", "focal", "asl"],
+        help="Loss function.",
+    )
+
+    parser.add_argument(
+        "--advanced_aug",
+        type=str,
+        default="none",
+        choices=["none", "mixup", "cutmix"],
+        help="Advanced augmentation method.",
+    )
+
+    parser.add_argument(
+        "--pretrained",
+        action="store_true",
+        help="Use pretrained weights. Default is False.",
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate.",
+    )
+
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay for AdamW.",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Number of epochs.",
+    )
+
     args = parser.parse_args()
     main(args)

@@ -69,3 +69,40 @@ class AsymmetricLoss(nn.Module):
             loss *= one_sided_w
 
         return -loss.mean()
+
+def get_loss(loss_name="bce", pos_weight=None):
+    """
+    Factory function để lấy loss theo tên.
+
+    loss_name:
+        - bce
+        - weighted_bce
+        - focal
+        - asl
+    """
+
+    loss_name = loss_name.lower()
+
+    if loss_name == "bce":
+        return nn.BCEWithLogitsLoss()
+
+    elif loss_name == "weighted_bce":
+        if pos_weight is None:
+            raise ValueError("pos_weight is required for weighted_bce")
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    elif loss_name == "focal":
+        return FocalLoss(alpha=1, gamma=2, reduction="mean")
+
+    elif loss_name == "asl":
+        return AsymmetricLoss(
+            gamma_neg=4,
+            gamma_pos=1,
+            clip=0.05
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown loss_name: {loss_name}. "
+            f"Available losses: bce, weighted_bce, focal, asl"
+        )
