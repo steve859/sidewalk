@@ -1,65 +1,145 @@
 import torch
 import torch.nn as nn
 import timm
-from src.models.aggregations import GlobalAveragePooling, AttentionPooling, GatedAttentionPooling
+
+from src.label_map import NUM_CLASSES
+from src.models.aggregations import (
+    GlobalAveragePooling,
+    AttentionPooling,
+    GatedAttentionPooling,
+)
+
+
+ENCODER_ZOO = {
+    # CNN baseline
+    "resnet50": "resnet50.a1_in1k",
+
+    # Efficient CNN
+    "efficientnet_b3": "tf_efficientnet_b3.ns_jft_in1k",
+
+    # Modern CNN
+    "convnext_tiny": "convnext_tiny.fb_in22k_ft_in1k",
+
+    # Vision Transformer
+    "swin_tiny": "swin_tiny_patch4_window7_224.ms_in1k",
+    "vit_base": "vit_base_patch16_224.augreg_in21k_ft_in1k",
+
+    # CLIP vision encoder, ImageNet fine-tuned version
+    "clip_vit_b32_cls": "vit_base_patch32_clip_224.openai_ft_in1k",
+}
+
 
 class SidewalkClassifier(nn.Module):
-    def __init__(self, model_name='resnet50', num_classes=7, pretrained=True, aggregation='gap'):
+    """
+    Multi-label classifier for sidewalk encroachment detection.
+
+    Input:
+        x: image tensor [B, 3, H, W]
+
+    Output:
+        logits: [B, num_classes]
+
+    Loss:
+        BCEWithLogitsLoss / Weighted BCE / Focal Loss / ASL
+    """
+
+    def __init__(
+        self,
+        encoder_name: str = "resnet50",
+        num_classes: int = NUM_CLASSES,
+        pretrained: bool = True,
+        aggregation: str = "gap",
+    ):
         super().__init__()
-        self.model_name = model_name
+
+        if encoder_name not in ENCODER_ZOO:
+            raise ValueError(
+                f"Unknown encoder_name: {encoder_name}. "
+                f"Available encoders: {list(ENCODER_ZOO.keys())}"
+            )
+
+        self.encoder_name = encoder_name
+        self.model_name = ENCODER_ZOO[encoder_name]
         self.aggregation_type = aggregation
-        
-        # Load model từ timm, bỏ đi lớp classifier cuối (num_classes=0) và không dùng global_pool mặc định
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0, global_pool='')
-        
-        # Xác định số chiều (C) của feature map sinh ra từ backbone
-        dummy_input = torch.randn(2, 3, 224, 224)
-        with torch.no_grad():
-            features = self.backbone(dummy_input)
-            
-        if features.dim() == 4:
-            in_features = features.shape[1] # (B, C, H, W)
-        elif features.dim() == 3:
-            in_features = features.shape[2] # (B, N, C)
-        else:
-            in_features = features.shape[1] # fallback
-            
-        # Feature Aggregation Module
-        if aggregation == 'gap':
+
+        self.backbone = timm.create_model(
+            self.model_name,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="",
+        )
+
+        in_features = self._infer_feature_dim()
+
+        if aggregation == "gap":
             self.aggregation = GlobalAveragePooling()
-        elif aggregation == 'attention':
+
+        elif aggregation == "attention":
             self.aggregation = AttentionPooling(in_features)
-        elif aggregation == 'gated_attention':
+
+        elif aggregation == "gated_attention":
             self.aggregation = GatedAttentionPooling(in_features)
-        elif aggregation == 'cls_token':
-            # Đối với mô hình hỗ trợ CLS token (như ViT), chúng ta xử lý ở hàm forward
-            self.aggregation = 'cls_token'
+
+        elif aggregation == "cls_token":
+            self.aggregation = None
+
         else:
-            raise ValueError(f"Unknown aggregation: {aggregation}")
-            
-        # Lớp phân loại cuối cùng
+            raise ValueError(
+                f"Unknown aggregation: {aggregation}. "
+                f"Available: gap, attention, gated_attention, cls_token"
+            )
+
         self.head = nn.Linear(in_features, num_classes)
+
+    def _infer_feature_dim(self):
+        self.backbone.eval()
+
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            features = self.backbone(dummy_input)
+
+        if features.dim() == 4:
+            # CNN-like feature map: [B, C, H, W]
+            return features.shape[1]
+
+        if features.dim() == 3:
+            # Transformer tokens: [B, N, C]
+            return features.shape[2]
+
+        if features.dim() == 2:
+            # Already pooled feature: [B, C]
+            return features.shape[1]
+
+        raise ValueError(f"Unsupported feature shape: {features.shape}")
 
     def forward(self, x):
         features = self.backbone(x)
-        
-        if self.aggregation_type == 'cls_token':
+
+        if self.aggregation_type == "cls_token":
             if features.dim() == 3:
-                # Lấy token đầu tiên (giả sử đó là CLS token cho ViT)
                 pooled = features[:, 0]
+            elif features.dim() == 4:
+                pooled = features.mean(dim=(2, 3))
+            elif features.dim() == 2:
+                pooled = features
             else:
-                # Nếu model không phải ViT mà vẫn truyền 'cls_token', ta fallback về GAP hoặc quăng lỗi
-                # raise ValueError("CLS token aggregation is only supported for transformers returning 3D tensors.")
-                pooled = features.mean(dim=[2, 3]) if features.dim() == 4 else features.mean(dim=1)
+                raise ValueError(f"Unsupported feature shape: {features.shape}")
         else:
             pooled = self.aggregation(features)
-            
+
         logits = self.head(pooled)
         return logits
 
-def create_model(model_name, aggregation='gap', num_classes=7):
-    """
-    Hàm hỗ trợ khởi tạo model nhanh
-    - model_name: 'resnet50', 'efficientnet_b3', 'convnext_tiny', 'swin_tiny_patch4_window7_224', 'vit_base_patch16_224'
-    """
-    return SidewalkClassifier(model_name=model_name, num_classes=num_classes, pretrained=True, aggregation=aggregation)
+
+def create_model(
+    encoder_name: str = "resnet50",
+    aggregation: str = "gap",
+    num_classes: int = NUM_CLASSES,
+    pretrained: bool = True,
+):
+    return SidewalkClassifier(
+        encoder_name=encoder_name,
+        num_classes=num_classes,
+        pretrained=pretrained,
+        aggregation=aggregation,
+    )
