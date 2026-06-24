@@ -2,7 +2,10 @@ torch
 torchvision
 timm
 albumentations
+opencv-python
+pillow
 scikit-learn
 pandas
 numpy
 tqdm
+matplotlib
