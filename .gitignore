@@ -1,47 +1,13 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Virtual Environment
-venv/
-.env
-
-# Data and Checkpoints (QUAN TRỌNG NHẤT)
-# Git sẽ tự động "làm ngơ" các file dữ liệu nặng và file trọng số mô hình
-# Tránh trường hợp bạn lỡ tay gõ 'git add .' và tải file 10GB lên GitHub làm treo máy.
-data/
-datasets/
-checkpoints/
-*.pth
-*.pt
-*.ckpt
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
 dataset
+merged_dataset
+sw2.coco
+sw3.coco
+sw4.coco
+sw5.coco
+sw6.coco
+sw7.coco
+sw8.coco
+sw9.coco
 sidewalk_images
+merge_coco.py
+train_2_(6604-7858).coco-20260711T165831Z-2-001.zip
